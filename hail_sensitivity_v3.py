@@ -20,8 +20,8 @@ ANGLE_COLORS = {
 }
 ANGLE_LABELS = {52: '52°', 60: '60°', 70: '70°', 77: '77°'}
 
-# Default market size by year (GWdc)
-DEFAULT_MARKET = {2025: 30, 2026: 36, 2027: 44, 2028: 50, 2029: 55, 2030: 60}
+# Default market size by year (GWdc) — user-adjustable in sidebar
+DEFAULT_MARKET = {2026: 36, 2027: 44, 2028: 50, 2029: 55, 2030: 60, 2031: 65, 2032: 70}
 
 
 def annuity_factor(r, n=40):
@@ -31,7 +31,7 @@ def annuity_factor(r, n=40):
 
 
 # ─── Page Config ───
-st.set_page_config(page_title="Hail Risk Sensitivity Tool", page_icon="🌨️",
+st.set_page_config(page_title="Hail Risk Sensitivity Tool v4", page_icon="🌨️",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -61,9 +61,14 @@ def load_data(suffix):
 
 @st.cache_data
 def load_orennia():
-    path = os.path.join(SCRIPT_DIR, 'orennia_matched.csv')
+    path = os.path.join(SCRIPT_DIR, 'orennia_market_demand_05.18.26.csv')
     if os.path.exists(path):
-        return pd.read_csv(path)
+        df = pd.read_csv(path)
+        required = ['hail_lat', 'hail_lon', 'Year', 'DC Capacity (MW)']
+        if all(col in df.columns for col in required):
+            return df
+        # Wrong format — log and skip
+        st.sidebar.warning("⚠️ orennia_market_demand_05.18.26.csv missing required columns. Using uniform distribution.")
     return None
 
 
@@ -302,7 +307,8 @@ def render_market_share(computed, orennia_df, label=""):
         yr_label = selected_year
 
     total_mw = total_gw * 1000
-    merged = None  # will hold location-level demand if Orennia data exists
+    merged = None
+    use_orennia = False
 
     # Method 1: If Orennia data exists, use project-level demand weighted by location
     if has_orennia:
@@ -322,7 +328,6 @@ def render_market_share(computed, orennia_df, label=""):
                 left_on=['hail_lat', 'hail_lon'], right_on=['lat', 'lon'], how='inner')
 
             if len(merged) > 0:
-                # Scale Orennia MW to match user-specified market size
                 orennia_total = merged['total_mw'].sum()
                 scale = total_mw / orennia_total if orennia_total > 0 else 1.0
                 merged['scaled_mw'] = merged['total_mw'] * scale
@@ -330,11 +335,11 @@ def render_market_share(computed, orennia_df, label=""):
                 angle_summary = merged.groupby('best_angle')['scaled_mw'].sum().reset_index()
                 angle_summary.columns = ['Best Product', 'MWdc']
                 data_source = "Orennia pipeline (scaled)"
-            else:
-                has_orennia = False  # fallback
+                use_orennia = True
 
-    # Method 2: No Orennia — distribute market evenly across grid locations
-    if not has_orennia or (has_orennia and selected_year != 'All Years' and len(oren_sub) == 0):
+    # Method 2: Fallback — distribute market evenly across grid locations
+    if not use_orennia:
+        merged = None
         n_locations = len(computed)
         mw_per_loc = total_mw / n_locations if n_locations > 0 else 0
         angle_summary = computed.groupby('best_angle').size().reset_index(name='count')
