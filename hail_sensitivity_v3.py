@@ -20,8 +20,8 @@ ANGLE_COLORS = {
 }
 ANGLE_LABELS = {52: '52°', 60: '60°', 70: '70°', 77: '77°'}
 
-# Default market size by year (GWdc) — user-adjustable in sidebar
-DEFAULT_MARKET = {2026: 36, 2027: 44, 2028: 50, 2029: 55, 2030: 60, 2031: 65, 2032: 70}
+# Default market size will be derived from demand data at load time
+DEMAND_FILE = 'orennia_market_demand_05.18.26_v2.csv'
 
 
 def annuity_factor(r, n=40):
@@ -61,15 +61,24 @@ def load_data(suffix):
 
 @st.cache_data
 def load_orennia():
-    path = os.path.join(SCRIPT_DIR, 'orennia_market_demand_05.18.26.csv')
+    path = os.path.join(SCRIPT_DIR, DEMAND_FILE)
     if os.path.exists(path):
         df = pd.read_csv(path)
         required = ['hail_lat', 'hail_lon', 'Year', 'DC Capacity (MW)']
         if all(col in df.columns for col in required):
             return df
-        # Wrong format — log and skip
-        st.sidebar.warning("⚠️ orennia_market_demand_05.18.26.csv missing required columns. Using uniform distribution.")
+        st.sidebar.warning(f"⚠️ {DEMAND_FILE} missing required columns. Using uniform distribution.")
     return None
+
+@st.cache_data
+def derive_market_defaults(orennia_df):
+    """Derive default market sizes (GWdc) per year from the demand data."""
+    if orennia_df is None:
+        return {2026: 36, 2027: 44, 2028: 50, 2029: 55, 2030: 60, 2031: 65, 2032: 70}
+    yearly = orennia_df.groupby('Year')['DC Capacity (MW)'].sum() / 1000  # MW -> GW
+    counts = orennia_df.groupby('Year').size()
+    valid_years = counts[counts >= 20].index
+    return {int(yr): round(yearly.get(yr, 0), 1) for yr in sorted(valid_years)}
 
 
 def compute_costs(df, replacement_cost, coverage_ratio, annual_premium,
@@ -167,10 +176,19 @@ risk_on = st.sidebar.checkbox("Developer Risk", value=True)
 capex_on = st.sidebar.checkbox("CapEx Premium", value=True)
 
 st.sidebar.markdown("### Market Size by Year (GWdc)")
+# Load demand data early so we can derive defaults
+_orennia_df = load_orennia()
+_market_defaults = derive_market_defaults(_orennia_df)
+
+if _orennia_df is not None:
+    st.sidebar.caption("Defaults from demand data (risk-adjusted). Override below.")
+else:
+    st.sidebar.caption("No demand file found. Enter market sizes manually.")
+
 market_sizes = {}
-for yr, default_gw in DEFAULT_MARKET.items():
+for yr, default_gw in _market_defaults.items():
     market_sizes[yr] = st.sidebar.number_input(
-        f"{yr}", min_value=0.0, max_value=200.0,
+        f"{yr} (data: {default_gw:.1f})", min_value=0.0, max_value=500.0,
         value=float(default_gw), step=1.0, key=f"mkt_{yr}")
 
 layers_active = []
@@ -595,7 +613,7 @@ st.caption(f"Discount rate: {interest_rate:.2f}% → {new_annuity:.2f}× annuity
            f"(base: 6.00% → {BASE_ANNUITY:.2f}×)  |  "
            f"Premium: {annual_premium:.2f}%  |  Coverage: {coverage_ratio}%")
 
-orennia_df = load_orennia()
+orennia_df = _orennia_df  # already loaded in sidebar section
 
 if glass_choice == "Compare Both":
     df20, df32 = load_data('20'), load_data('32')
