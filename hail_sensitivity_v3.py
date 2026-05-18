@@ -92,21 +92,38 @@ def compute_costs(df, replacement_cost, coverage_ratio, annual_premium,
 
 
 def interpolate_best_product(lats, lons, best_angles):
-    """Create a dense grid of best-product assignments via nearest-neighbor."""
+    """Create a dense grid of best-product assignments, clipped to data footprint."""
     from scipy.interpolate import NearestNDInterpolator
+    from scipy.spatial import Delaunay, cKDTree
+
     points = np.column_stack([lats, lons])
     interp = NearestNDInterpolator(points, best_angles)
-    lat_range = np.arange(lats.min() - 0.5, lats.max() + 0.5, 0.25)
-    lon_range = np.arange(lons.min() - 0.5, lons.max() + 0.5, 0.25)
+    hull = Delaunay(points)
+    tree = cKDTree(points)
+
+    lat_range = np.arange(lats.min() - 0.25, lats.max() + 0.25, 0.25)
+    lon_range = np.arange(lons.min() - 0.25, lons.max() + 0.25, 0.25)
     grid_lat, grid_lon = np.meshgrid(lat_range, lon_range)
-    grid_vals = interp(grid_lat.ravel(), grid_lon.ravel())
+    grid_pts = np.column_stack([grid_lat.ravel(), grid_lon.ravel()])
+
+    # Clip: only points inside convex hull AND within 1.5° of a data point
+    inside = hull.find_simplex(grid_pts) >= 0
+    dists, _ = tree.query(grid_pts)
+    mask = inside & (dists < 1.5)
+
+    clipped_pts = grid_pts[mask]
+    grid_vals = interp(clipped_pts[:, 0], clipped_pts[:, 1])
+
     grid_df = pd.DataFrame({
-        'lat': grid_lat.ravel(), 'lon': grid_lon.ravel(),
+        'lat': clipped_pts[:, 0], 'lon': clipped_pts[:, 1],
         'best_angle': grid_vals.astype(int),
     })
     grid_df['color'] = grid_df['best_angle'].map(ANGLE_COLORS)
     grid_df['best_angle_display'] = grid_df['best_angle'].astype(str) + '°'
     return grid_df
+
+# US States GeoJSON URL (loaded at runtime by pydeck from public CDN)
+US_STATES_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 
 
 # ─── Sidebar ───
@@ -203,10 +220,14 @@ def render_single(df, label=""):
                 })
     map_df = pd.DataFrame(map_rows)
     if len(map_df) > 0:
-        st.pydeck_chart(pdk.Deck(
-            layers=[pdk.Layer("ColumnLayer", data=map_df, get_position='[lon, lat]',
+        col_layer = pdk.Layer("ColumnLayer", data=map_df, get_position='[lon, lat]',
                               get_elevation='elevation', elevation_scale=1, radius=12000,
-                              get_fill_color='color', pickable=True, auto_highlight=True)],
+                              get_fill_color='color', pickable=True, auto_highlight=True)
+        states_3d = pdk.Layer("GeoJsonLayer", data=US_STATES_URL,
+                              stroked=True, filled=False, pickable=False,
+                              get_line_color=[100, 100, 100, 140], line_width_min_pixels=1)
+        st.pydeck_chart(pdk.Deck(
+            layers=[states_3d, col_layer],
             initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=45),
             map_style="light",
             tooltip={"html": "<b>{angle}°</b>: {cost_display} ¢/W",
@@ -221,14 +242,26 @@ def render_single(df, label=""):
 
     grid_df = interpolate_best_product(computed['lat'].values, computed['lon'].values,
                                         computed['best_angle'].values)
+
+    # Background: interpolated fill (not pickable — tooltip comes from foreground only)
     bg_layer = pdk.Layer("ScatterplotLayer", data=grid_df, get_position='[lon, lat]',
-                         get_fill_color='color', get_radius=15000, pickable=True,
-                         auto_highlight=True, opacity=0.7)
+                         get_fill_color='color', get_radius=15000, pickable=False,
+                         opacity=0.65)
+
+    # Foreground: actual data points (pickable for tooltip)
     fg_layer = pdk.Layer("ScatterplotLayer", data=computed, get_position='[lon, lat]',
                          get_fill_color='color', get_radius=8000, pickable=True,
                          auto_highlight=True, opacity=1.0)
+
+    # State borders
+    states_layer = pdk.Layer(
+        "GeoJsonLayer", data=US_STATES_URL,
+        stroked=True, filled=False, pickable=False,
+        get_line_color=[100, 100, 100, 180], line_width_min_pixels=1,
+    )
+
     st.pydeck_chart(pdk.Deck(
-        layers=[bg_layer, fg_layer],
+        layers=[bg_layer, states_layer, fg_layer],
         initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=0),
         map_style="light",
         tooltip={"html": "<b>Best:</b> {best_angle}° — {best_cost_display} ¢/W",
@@ -412,10 +445,15 @@ def render_value_gap(computed, label=""):
     computed['base_display'] = computed['base_cost'].round(3).astype(str)
     computed['subset_display'] = computed['subset_cost'].round(3).astype(str)
 
+    states_layer = pdk.Layer("GeoJsonLayer", data=US_STATES_URL,
+                             stroked=True, filled=False, pickable=False,
+                             get_line_color=[100, 100, 100, 180], line_width_min_pixels=1)
+
     st.pydeck_chart(pdk.Deck(
         layers=[pdk.Layer("ScatterplotLayer", data=computed, get_position='[lon, lat]',
                           get_fill_color='gap_color', get_radius=30000,
-                          pickable=True, auto_highlight=True)],
+                          pickable=True, auto_highlight=True),
+                states_layer],
         initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=0),
         map_style="light",
         tooltip={"html": ("<b>Full portfolio:</b> {base_display} ¢/W<br>"
