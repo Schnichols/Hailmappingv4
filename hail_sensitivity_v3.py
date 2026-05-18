@@ -302,6 +302,7 @@ def render_market_share(computed, orennia_df, label=""):
         yr_label = selected_year
 
     total_mw = total_gw * 1000
+    merged = None  # will hold location-level demand if Orennia data exists
 
     # Method 1: If Orennia data exists, use project-level demand weighted by location
     if has_orennia:
@@ -364,6 +365,46 @@ def render_market_share(computed, orennia_df, label=""):
     with c2:
         chart_df = angle_summary.set_index('Best Product')[['GWdc']]
         st.bar_chart(chart_df, use_container_width=True, height=300)
+
+    # ─── 3D Demand Map: MW capacity columns by location, colored by best angle ───
+    st.markdown("#### 🏗️ Demand by Location (MWdc)")
+
+    # Build location-level demand data for the map
+    if merged is not None and len(merged) > 0:
+        map_demand = merged[['lat', 'lon', 'best_angle', 'scaled_mw']].copy()
+        map_demand.rename(columns={'scaled_mw': 'mw'}, inplace=True)
+    else:
+        # Uniform fallback: every location gets equal share
+        map_demand = computed[['lat', 'lon', 'best_angle']].copy()
+        n_locs = len(map_demand)
+        map_demand['mw'] = total_mw / n_locs if n_locs > 0 else 0
+
+    map_demand = map_demand[map_demand['mw'] > 0].copy()
+
+    if len(map_demand) > 0:
+        map_demand['color'] = map_demand['best_angle'].map(ANGLE_COLORS)
+        map_demand['elevation'] = map_demand['mw'] * 200  # scale for visibility
+        map_demand['mw_display'] = map_demand['mw'].round(0).astype(int).astype(str)
+        map_demand['angle_display'] = map_demand['best_angle'].astype(str) + '°'
+
+        demand_col_layer = pdk.Layer(
+            "ColumnLayer", data=map_demand, get_position='[lon, lat]',
+            get_elevation='elevation', elevation_scale=1, radius=18000,
+            get_fill_color='color', pickable=True, auto_highlight=True,
+        )
+        states_demand = pdk.Layer("GeoJsonLayer", data=US_STATES_URL,
+                                  stroked=True, filled=False, pickable=False,
+                                  get_line_color=[100, 100, 100, 140], line_width_min_pixels=1)
+        st.pydeck_chart(pdk.Deck(
+            layers=[states_demand, demand_col_layer],
+            initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=45),
+            map_style="light",
+            tooltip={"html": "<b>{angle_display}</b> — {mw_display} MWdc",
+                     "style": {"backgroundColor": "#1e293b", "color": "#e2e8f0",
+                                "fontSize": "13px", "padding": "8px 12px", "borderRadius": "8px"}},
+        ), use_container_width=True, height=500)
+    else:
+        st.info("No demand data to display for the selected year.")
 
     # Year-over-year comparison table
     if selected_year == 'All Years':
