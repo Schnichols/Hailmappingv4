@@ -20,8 +20,9 @@ ANGLE_COLORS = {
 }
 ANGLE_LABELS = {52: '52°', 60: '60°', 70: '70°', 77: '77°'}
 
-# Default market size will be derived from demand data at load time
-DEMAND_FILE = 'orennia_market_demand_05.18.26_v2.csv'
+# Demand data files
+ORENNIA_FILE = 'orennia_market_demand_05.18.26_v2.csv'
+WOODMAC_FILE = 'woodmac_demand_05.18.26.csv'
 
 
 def annuity_factor(r, n=40):
@@ -31,7 +32,7 @@ def annuity_factor(r, n=40):
 
 
 # ─── Page Config ───
-st.set_page_config(page_title="Hail Risk Sensitivity Tool v4", page_icon="🌨️",
+st.set_page_config(page_title="Hail Risk Sensitivity Tool v5", page_icon="🌨️",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -60,23 +61,25 @@ def load_data(suffix):
     return pd.read_csv(os.path.join(SCRIPT_DIR, f'hail_data_{suffix}.csv'))
 
 @st.cache_data
-def load_orennia():
-    path = os.path.join(SCRIPT_DIR, DEMAND_FILE)
+def load_demand_data(source):
+    """Load demand CSV for the selected source."""
+    filename = ORENNIA_FILE if source == 'Orennia' else WOODMAC_FILE
+    path = os.path.join(SCRIPT_DIR, filename)
     if os.path.exists(path):
         df = pd.read_csv(path)
         required = ['hail_lat', 'hail_lon', 'Year', 'DC Capacity (MW)']
         if all(col in df.columns for col in required):
             return df
-        st.sidebar.warning(f"⚠️ {DEMAND_FILE} missing required columns. Using uniform distribution.")
+        st.sidebar.warning(f"⚠️ {filename} missing required columns. Using uniform distribution.")
     return None
 
 @st.cache_data
-def derive_market_defaults(orennia_df):
+def derive_market_defaults(demand_df):
     """Derive default market sizes (GWdc) per year from the demand data."""
-    if orennia_df is None:
+    if demand_df is None:
         return {2026: 36, 2027: 44, 2028: 50, 2029: 55, 2030: 60, 2031: 65, 2032: 70}
-    yearly = orennia_df.groupby('Year')['DC Capacity (MW)'].sum() / 1000  # MW -> GW
-    counts = orennia_df.groupby('Year').size()
+    yearly = demand_df.groupby('Year')['DC Capacity (MW)'].sum() / 1000
+    counts = demand_df.groupby('Year').size()
     valid_years = counts[counts >= 20].index
     return {int(yr): round(yearly.get(yr, 0), 1) for yr in sorted(valid_years)}
 
@@ -175,13 +178,22 @@ ins_on = st.sidebar.checkbox("Insurance", value=True)
 risk_on = st.sidebar.checkbox("Developer Risk", value=True)
 capex_on = st.sidebar.checkbox("CapEx Premium", value=True)
 
+st.sidebar.markdown("### Demand Data Source")
+demand_source = st.sidebar.radio(
+    "Select demand forecast",
+    ["Orennia", "Wood Mackenzie"],
+    index=0, horizontal=True,
+    help="Orennia: project-level risk-adjusted pipeline. WoodMac: state-level forecast, distributed evenly across grid."
+)
+
 st.sidebar.markdown("### Market Size by Year (GWdc)")
 # Load demand data early so we can derive defaults
-_orennia_df = load_orennia()
-_market_defaults = derive_market_defaults(_orennia_df)
+_demand_df = load_demand_data(demand_source)
+_market_defaults = derive_market_defaults(_demand_df)
 
-if _orennia_df is not None:
-    st.sidebar.caption("Defaults from demand data (risk-adjusted). Override below.")
+if _demand_df is not None:
+    src_label = "Orennia (risk-adj pipeline)" if demand_source == "Orennia" else "Wood Mackenzie (state forecast)"
+    st.sidebar.caption(f"Defaults from {src_label}. Override below.")
 else:
     st.sidebar.caption("No demand file found. Enter market sizes manually.")
 
@@ -189,7 +201,7 @@ market_sizes = {}
 for yr, default_gw in _market_defaults.items():
     market_sizes[yr] = st.sidebar.number_input(
         f"{yr} (data: {default_gw:.1f})", min_value=0.0, max_value=500.0,
-        value=float(default_gw), step=1.0, key=f"mkt_{yr}")
+        value=float(default_gw), step=1.0, key=f"mkt_{yr}_{demand_source}")
 
 layers_active = []
 if ins_on: layers_active.append("Ins")
@@ -309,7 +321,8 @@ def render_single(df, label=""):
 def render_market_share(computed, orennia_df, label=""):
     """Market share by tilt angle with year toggle and scalable market size."""
     st.markdown("---")
-    st.markdown("### 📈 Market Share by Tilt Angle" + (f" — {label}" if label else ""))
+    source_tag = f" [{demand_source}]"
+    st.markdown("### 📈 Market Share by Tilt Angle" + (f" — {label}" if label else "") + source_tag)
 
     has_orennia = orennia_df is not None
     years = sorted(market_sizes.keys())
@@ -611,9 +624,10 @@ st.markdown('<p class="subtitle">Interactive sensitivity analysis across tracker
 new_annuity = annuity_factor(interest_rate / 100.0)
 st.caption(f"Discount rate: {interest_rate:.2f}% → {new_annuity:.2f}× annuity "
            f"(base: 6.00% → {BASE_ANNUITY:.2f}×)  |  "
-           f"Premium: {annual_premium:.2f}%  |  Coverage: {coverage_ratio}%")
+           f"Premium: {annual_premium:.2f}%  |  Coverage: {coverage_ratio}%  |  "
+           f"Demand: **{demand_source}**")
 
-orennia_df = _orennia_df  # already loaded in sidebar section
+orennia_df = _demand_df  # loaded in sidebar section (Orennia or WoodMac)
 
 if glass_choice == "Compare Both":
     df20, df32 = load_data('20'), load_data('32')
@@ -662,7 +676,8 @@ with p1:
 with p2:
     st.markdown(f"| Parameter | Value |\n|---|---|\n| Annual Premium | **{annual_premium:.2f}%** |"
                 f"\n| Coverage Ratio | **{coverage_ratio}%** |\n| Dev Risk Factor | **{risk_pct}%** |"
-                f"\n| Active Layers | **{layers_str}** |")
+                f"\n| Active Layers | **{layers_str}** |"
+                f"\n| Demand Source | **{demand_source}** |")
 with p3:
     mkt_str = "| Year | GWdc |\n|---|---|"
     for yr in sorted(market_sizes.keys()):
