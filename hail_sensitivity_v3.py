@@ -43,11 +43,21 @@ st.markdown("""
     .subtitle { font-size: 1rem; color: #6b7280; margin-top: 0; margin-bottom: 1.5rem; }
     section[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%); color: #f1f5f9; }
     section[data-testid="stSidebar"] .stMarkdown h3 { color: #f8fafc; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1.5px; margin-top: 1.5rem; font-weight: 700; }
-    section[data-testid="stSidebar"] label { color: #f1f5f9 !important; font-weight: 500; }
-    section[data-testid="stSidebar"] .stMarkdown p { color: #e2e8f0 !important; }
-    section[data-testid="stSidebar"] .stRadio label, section[data-testid="stSidebar"] .stCheckbox label { color: #f8fafc !important; }
-    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: #cbd5e1 !important; }
-    section[data-testid="stSidebar"] .stNumberInput label, section[data-testid="stSidebar"] .stSlider label { color: #f1f5f9 !important; }
+    section[data-testid="stSidebar"] * { color: #f1f5f9 !important; }
+    section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] label p,
+    section[data-testid="stSidebar"] label div, section[data-testid="stSidebar"] label span {
+        color: #f8fafc !important; font-weight: 500 !important; opacity: 1 !important;
+    }
+    section[data-testid="stSidebar"] .stCheckbox label p, section[data-testid="stSidebar"] .stRadio label p,
+    section[data-testid="stSidebar"] .stCheckbox div, section[data-testid="stSidebar"] .stRadio div {
+        color: #f8fafc !important; opacity: 1 !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {
+        color: #f8fafc !important; opacity: 1 !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] * { color: #cbd5e1 !important; }
     .metric-card { background: linear-gradient(135deg, #f8fafc, #f1f5f9); border-radius: 12px; padding: 1.2rem; border: 1px solid #e2e8f0; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
     .metric-card h4 { margin: 0; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: #64748b; }
     .metric-card .value { font-family: 'JetBrains Mono', monospace; font-size: 1.5rem; font-weight: 700; margin: 0.3rem 0; }
@@ -890,11 +900,13 @@ def render_luce_demand_map(luce_result, label=""):
         return
     st.markdown("---")
     st.markdown("### 🎯 Probability-Adjusted Demand Map" + (f" — {label}" if label else ""))
-    st.markdown("Select which tilt angles to highlight. **Bar height** = probability-adjusted demand "
-                "from the selected angles. **Bar color** = how the selected angles' combined probability "
-                "compares to random chance (k/n where k = selected, n = active).")
+    st.markdown("The Luce probabilities are always computed against the **full set of active tilt "
+                "angles** (the competing market). The checkboxes below select **your portfolio subset** — "
+                "the map then shows how much probability-adjusted demand that subset captures. "
+                "**Bar height** = demand × P(subset wins). **Bar color** = subset's combined probability "
+                "vs. random chance (k/n, where k = boxes checked, n = active angles).")
 
-    # Checkboxes — second layer of selection, only among active angles
+    # Checkboxes select the portfolio SUBSET; the competing market is always all ACTIVE_ANGLES
     cb_cols = st.columns(max(1, len(ACTIVE_ANGLES)))
     selected_angles = []
     for i, angle in enumerate(ACTIVE_ANGLES):
@@ -903,20 +915,20 @@ def render_luce_demand_map(luce_result, label=""):
                 selected_angles.append(angle)
 
     if len(selected_angles) == 0:
-        st.info("Select at least one angle to display the probability-adjusted map.")
+        st.info("Select at least one angle for your portfolio subset.")
         return
 
     n_active = len(ACTIVE_ANGLES)
     k_selected = len(selected_angles)
-    p_random = k_selected / n_active  # baseline probability if costs were equal
+    p_random = k_selected / n_active  # baseline: if all costs equal, subset would capture k/n
 
     merged_demand = luce_result['merged_demand']
     map_df = merged_demand[['lat', 'lon', 'scaled_mw'] +
                              [f'prob_{a}' for a in ACTIVE_ANGLES]].copy()
 
-    # Sum the probabilities of selected angles
+    # P(subset) = sum of full-market probabilities for the checked angles
     map_df['p_selected'] = sum(map_df[f'prob_{a}'] for a in selected_angles)
-    # Probability-adjusted MW from the selected subset
+    # Probability-adjusted MW captured by the subset
     map_df['adj_mw'] = map_df['scaled_mw'] * map_df['p_selected']
 
     # Color: log ratio of P_selected to p_random, clamped to [-1.5, 1.5]
