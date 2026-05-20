@@ -32,7 +32,7 @@ def annuity_factor(r, n=40):
 
 
 # ─── Page Config ───
-st.set_page_config(page_title="Hail Risk Sensitivity Tool v5", page_icon="🌨️",
+st.set_page_config(page_title="Hail Risk Sensitivity Tool v6", page_icon="🌨️",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -85,7 +85,10 @@ def derive_market_defaults(demand_df):
 
 
 def compute_costs(df, replacement_cost, coverage_ratio, annual_premium,
-                  interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on):
+                  interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on,
+                  active_angles=None):
+    if active_angles is None:
+        active_angles = ANGLES
     new_annuity = annuity_factor(interest_rate / 100.0)
     ins_scale = ((replacement_cost / BASE_RC) * (coverage_ratio / 125.0)
                  * (annual_premium / 1.25) * (new_annuity / BASE_ANNUITY))
@@ -102,10 +105,41 @@ def compute_costs(df, replacement_cost, coverage_ratio, annual_premium,
         computed[f'risk_{angle}'] = risk_val if risk_on else 0.0
         computed[f'capex_{angle}'] = capex_val if capex_on else 0.0
 
-    total_cols = [f'total_{a}' for a in ANGLES]
-    computed['best_angle'] = computed[total_cols].idxmin(axis=1).str.replace('total_', '').astype(int)
-    computed['best_cost'] = computed[total_cols].min(axis=1)
+    # Best angle selection only among active angles
+    active_cols = [f'total_{a}' for a in active_angles]
+    computed['best_angle'] = computed[active_cols].idxmin(axis=1).str.replace('total_', '').astype(int)
+    computed['best_cost'] = computed[active_cols].min(axis=1)
     return computed
+
+
+def compute_blended(df20, df32, pct_20, replacement_cost, coverage_ratio, annual_premium,
+                    interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on,
+                    active_angles=None):
+    """Pro-rata blend of 2.0mm and 3.2mm glass results.
+
+    For each angle: blended_total = (pct_20/100) * total_20 + (1-pct_20/100) * total_32
+    Best angle is then selected from blended totals.
+    """
+    if active_angles is None:
+        active_angles = ANGLES
+    c20 = compute_costs(df20, replacement_cost, coverage_ratio, annual_premium,
+                        interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on, active_angles)
+    c32 = compute_costs(df32, replacement_cost, coverage_ratio, annual_premium,
+                        interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on, active_angles)
+
+    # Merge on lat/lon
+    blended = c20[['lat', 'lon']].copy()
+    w20 = pct_20 / 100.0
+    w32 = 1 - w20
+    for col_prefix in ['total_', 'ins_', 'risk_', 'capex_']:
+        for angle in ANGLES:
+            col = f'{col_prefix}{angle}'
+            blended[col] = w20 * c20[col].values + w32 * c32[col].values
+
+    active_cols = [f'total_{a}' for a in active_angles]
+    blended['best_angle'] = blended[active_cols].idxmin(axis=1).str.replace('total_', '').astype(int)
+    blended['best_cost'] = blended[active_cols].min(axis=1)
+    return blended
 
 
 def interpolate_best_product(lats, lons, best_angles):
@@ -146,9 +180,28 @@ US_STATES_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/maste
 # ─── Sidebar ───
 st.sidebar.markdown("## 🌨️ Hail Sensitivity Tool")
 
+st.sidebar.markdown("### Tilt Angles in Analysis")
+st.sidebar.caption("Toggle which stow angles are considered.")
+ang_cols = st.sidebar.columns(4)
+angle_enabled = {}
+defaults = {52: True, 60: True, 70: True, 77: True}
+for i, a in enumerate(ANGLES):
+    with ang_cols[i]:
+        angle_enabled[a] = st.checkbox(f"{a}°", value=defaults[a], key=f"ang_{a}")
+ACTIVE_ANGLES = [a for a in ANGLES if angle_enabled[a]]
+if not ACTIVE_ANGLES:
+    st.sidebar.error("Select at least one tilt angle.")
+    ACTIVE_ANGLES = [52]
+
 st.sidebar.markdown("### Glass Type")
-glass_choice = st.sidebar.radio("Module glass thickness", ["3.2 mm", "2.0 mm", "Compare Both"],
+glass_choice = st.sidebar.radio("Module glass thickness",
+                                 ["3.2 mm", "2.0 mm", "Blended", "Compare Both"],
                                  index=0, horizontal=True)
+if glass_choice == "Blended":
+    glass_pct_20 = st.sidebar.slider("2.0 mm Share (%)", 0, 100, 50, 5,
+                                      help="Pro-rata mix of 2.0mm and 3.2mm glass. Default 50/50.")
+else:
+    glass_pct_20 = 50  # unused
 
 st.sidebar.markdown("### Economics")
 replacement_cost = st.sidebar.slider("Module Replacement Cost ($/W)", 0.20, 0.60, 0.34, 0.01,
@@ -178,30 +231,43 @@ ins_on = st.sidebar.checkbox("Insurance", value=True)
 risk_on = st.sidebar.checkbox("Developer Risk", value=True)
 capex_on = st.sidebar.checkbox("CapEx Premium", value=True)
 
-st.sidebar.markdown("### Demand Data Source")
-demand_source = st.sidebar.radio(
-    "Select demand forecast",
+st.sidebar.markdown("### Demand Shape (geographic distribution)")
+demand_shape = st.sidebar.radio(
+    "Where is demand located",
     ["Orennia", "Wood Mackenzie"],
-    index=0, horizontal=True,
-    help="Orennia: project-level risk-adjusted pipeline. WoodMac: state-level forecast, distributed evenly across grid."
+    index=0, horizontal=True, key="shape_src",
+    help="Orennia = project-level pipeline locations. WoodMac = state-level evenly distributed."
 )
 
-st.sidebar.markdown("### Market Size by Year (GWdc)")
-# Load demand data early so we can derive defaults
-_demand_df = load_demand_data(demand_source)
-_market_defaults = derive_market_defaults(_demand_df)
+st.sidebar.markdown("### Demand Magnitude (total GW)")
+magnitude_source = st.sidebar.radio(
+    "Total GW per year from",
+    ["Orennia", "Wood Mackenzie", "Manual"],
+    index=0, horizontal=True, key="mag_src",
+    help="Defaults from the chosen forecast. 'Manual' lets you set everything yourself."
+)
 
-if _demand_df is not None:
-    src_label = "Orennia (risk-adj pipeline)" if demand_source == "Orennia" else "Wood Mackenzie (state forecast)"
-    st.sidebar.caption(f"Defaults from {src_label}. Override below.")
-else:
-    st.sidebar.caption("No demand file found. Enter market sizes manually.")
+# Load both demand sources
+_shape_df = load_demand_data(demand_shape)
+_orennia_df_full = load_demand_data("Orennia")
+_woodmac_df_full = load_demand_data("Wood Mackenzie")
+
+# Derive defaults from the magnitude source (or use Orennia's if Manual)
+if magnitude_source == "Orennia":
+    _market_defaults = derive_market_defaults(_orennia_df_full)
+elif magnitude_source == "Wood Mackenzie":
+    _market_defaults = derive_market_defaults(_woodmac_df_full)
+else:  # Manual
+    _market_defaults = {2026: 36, 2027: 44, 2028: 50, 2029: 55, 2030: 60, 2031: 65, 2032: 70}
+
+st.sidebar.markdown("### Market Size by Year (GWdc)")
+st.sidebar.caption(f"Shape: **{demand_shape}**  |  Magnitude: **{magnitude_source}**")
 
 market_sizes = {}
 for yr, default_gw in _market_defaults.items():
     market_sizes[yr] = st.sidebar.number_input(
         f"{yr} (data: {default_gw:.1f})", min_value=0.0, max_value=500.0,
-        value=float(default_gw), step=1.0, key=f"mkt_{yr}_{demand_source}")
+        value=float(default_gw), step=1.0, key=f"mkt_{yr}_{magnitude_source}")
 
 layers_active = []
 if ins_on: layers_active.append("Ins")
@@ -214,16 +280,20 @@ layers_str = " + ".join(layers_active) if layers_active else "None"
 # RENDERING FUNCTIONS
 # ═══════════════════════════════════════════
 
-def render_single(df, label=""):
-    computed = compute_costs(df, replacement_cost, coverage_ratio, annual_premium,
-                             interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on)
+def render_single(df, label="", precomputed=None):
+    if precomputed is not None:
+        computed = precomputed
+    else:
+        computed = compute_costs(df, replacement_cost, coverage_ratio, annual_premium,
+                                 interest_rate, risk_pct, capex_dict, ins_on, risk_on, capex_on,
+                                 active_angles=ACTIVE_ANGLES)
 
     if label:
         st.markdown(f"#### {label}")
 
-    # ─── Metric Cards ───
-    cols = st.columns(4)
-    for i, angle in enumerate(ANGLES):
+    # ─── Metric Cards (only active angles) ───
+    cols = st.columns(max(1, len(ACTIVE_ANGLES)))
+    for i, angle in enumerate(ACTIVE_ANGLES):
         avg = computed[f'total_{angle}'].mean()
         c = ANGLE_COLORS[angle]
         with cols[i]:
@@ -234,20 +304,21 @@ def render_single(df, label=""):
     win_counts = computed['best_angle'].value_counts()
     overall_winner = win_counts.idxmax()
     win_pct = win_counts.max() / len(computed) * 100
+    angles_str = ", ".join([f"{a}°" for a in ACTIVE_ANGLES])
     st.markdown(f'<div class="winner-banner">🏆 {overall_winner}° wins at {win_counts.max()} of '
-                f'{len(computed)} locations ({win_pct:.1f}%) — Layers: {layers_str}</div>',
+                f'{len(computed)} locations ({win_pct:.1f}%) — Layers: {layers_str} — Angles: {angles_str}</div>',
                 unsafe_allow_html=True)
 
-    # ─── 3D Column Map ───
+    # ─── 3D Column Map (only active angles) ───
     st.markdown("#### 🗺️ Total Cost by Angle (3D Columns)")
     map_rows = []
     for _, row in computed.iterrows():
-        for angle in ANGLES:
+        for angle in ACTIVE_ANGLES:
             val = row[f'total_{angle}']
             if val > 0:
                 map_rows.append({
                     'lat': row['lat'],
-                    'lon': row['lon'] + (ANGLES.index(angle) - 1.5) * 0.15,
+                    'lon': row['lon'] + (ACTIVE_ANGLES.index(angle) - (len(ACTIVE_ANGLES)-1)/2) * 0.15,
                     'elevation': val * 50000,
                     'color': ANGLE_COLORS[angle],
                     'angle': angle,
@@ -304,13 +375,13 @@ def render_single(df, label=""):
                             "fontSize": "13px", "padding": "8px 12px", "borderRadius": "8px"}},
     ), use_container_width=True, height=500)
 
-    # ─── Win Count Table ───
+    # ─── Win Count Table (active angles only) ───
     st.markdown("#### 📊 Win Counts")
     wc = pd.DataFrame({
-        'Angle': [f'{a}°' for a in ANGLES],
-        'Wins': [win_counts.get(a, 0) for a in ANGLES],
-        'Win %': [f"{win_counts.get(a, 0)/len(computed)*100:.1f}%" for a in ANGLES],
-        'Avg Total (¢/W)': [f"{computed[f'total_{a}'].mean():.4f}" for a in ANGLES],
+        'Angle': [f'{a}°' for a in ACTIVE_ANGLES],
+        'Wins': [win_counts.get(a, 0) for a in ACTIVE_ANGLES],
+        'Win %': [f"{win_counts.get(a, 0)/len(computed)*100:.1f}%" for a in ACTIVE_ANGLES],
+        'Avg Total (¢/W)': [f"{computed[f'total_{a}'].mean():.4f}" for a in ACTIVE_ANGLES],
     })
     st.dataframe(wc, hide_index=True, use_container_width=True)
 
@@ -318,81 +389,80 @@ def render_single(df, label=""):
 
 
 # ─── Market Share & Demand Analysis ───
-def render_market_share(computed, orennia_df, label=""):
-    """Market share by tilt angle with year toggle and scalable market size."""
+def render_market_share(computed, shape_df, label=""):
+    """Market share by tilt angle with multi-year select, shape/magnitude split, and export."""
     st.markdown("---")
-    source_tag = f" [{demand_source}]"
-    st.markdown("### 📈 Market Share by Tilt Angle" + (f" — {label}" if label else "") + source_tag)
+    st.markdown("### 📈 Market Share by Tilt Angle"
+                + (f" — {label}" if label else "")
+                + f"  [shape: {demand_shape}, magnitude: {magnitude_source}]")
 
-    has_orennia = orennia_df is not None
+    has_shape = shape_df is not None
     years = sorted(market_sizes.keys())
-    year_options = ['All Years'] + [str(y) for y in years]
-    selected_year = st.selectbox("Select Year", year_options, index=0, key=f"mkt_year_{label}")
 
-    if selected_year == 'All Years':
-        total_gw = sum(market_sizes.values())
-        yr_label = f"All Years ({min(years)}–{max(years)})"
-    else:
-        yr = int(selected_year)
-        total_gw = market_sizes.get(yr, 0)
-        yr_label = selected_year
+    # ─── Multi-year selector ───
+    st.markdown("**Years to include** (select one or more):")
+    yr_cols = st.columns(min(len(years), 8))
+    year_selected = {}
+    for i, yr in enumerate(years):
+        with yr_cols[i % len(yr_cols)]:
+            year_selected[yr] = st.checkbox(str(yr), value=True, key=f"yrsel_{yr}_{label}")
+    selected_years = [yr for yr in years if year_selected[yr]]
 
+    if not selected_years:
+        st.warning("Select at least one year.")
+        return
+
+    total_gw = sum(market_sizes[yr] for yr in selected_years)
     total_mw = total_gw * 1000
+    yr_label = (f"{min(selected_years)}–{max(selected_years)}"
+                if len(selected_years) > 1 else str(selected_years[0]))
+
+    # ─── Build location-level scaled demand from shape source ───
     merged = None
-    use_orennia = False
-
-    # Method 1: If Orennia data exists, use project-level demand weighted by location
-    if has_orennia:
-        if selected_year == 'All Years':
-            oren_sub = orennia_df.copy()
-        else:
-            oren_sub = orennia_df[orennia_df['Year'] == int(selected_year)].copy()
-
-        if len(oren_sub) > 0:
-            demand_by_loc = oren_sub.groupby(['hail_lat', 'hail_lon']).agg(
-                total_mw=('DC Capacity (MW)', 'sum'),
-                project_count=('DC Capacity (MW)', 'count'),
-            ).reset_index()
-
+    use_shape = False
+    if has_shape:
+        shape_sub = shape_df[shape_df['Year'].isin(selected_years)].copy()
+        if len(shape_sub) > 0:
+            demand_by_loc = shape_sub.groupby(['hail_lat', 'hail_lon']).agg(
+                total_mw=('DC Capacity (MW)', 'sum')).reset_index()
             merged = demand_by_loc.merge(
                 computed[['lat', 'lon', 'best_angle']],
                 left_on=['hail_lat', 'hail_lon'], right_on=['lat', 'lon'], how='inner')
-
             if len(merged) > 0:
-                orennia_total = merged['total_mw'].sum()
-                scale = total_mw / orennia_total if orennia_total > 0 else 1.0
+                shape_total = merged['total_mw'].sum()
+                scale = total_mw / shape_total if shape_total > 0 else 1.0
                 merged['scaled_mw'] = merged['total_mw'] * scale
-
                 angle_summary = merged.groupby('best_angle')['scaled_mw'].sum().reset_index()
                 angle_summary.columns = ['Best Product', 'MWdc']
-                data_source = "Orennia pipeline (scaled)"
-                use_orennia = True
+                data_source = f"Shape: {demand_shape} (scaled to {total_gw:.1f} GW)"
+                use_shape = True
 
-    # Method 2: Fallback — distribute market evenly across grid locations
-    if not use_orennia:
+    if not use_shape:
         merged = None
         n_locations = len(computed)
         mw_per_loc = total_mw / n_locations if n_locations > 0 else 0
         angle_summary = computed.groupby('best_angle').size().reset_index(name='count')
         angle_summary['MWdc'] = angle_summary['count'] * mw_per_loc
-        angle_summary = angle_summary[['best_angle', 'MWdc']].copy()
+        angle_summary = angle_summary[['best_angle', 'MWdc']]
         angle_summary.columns = ['Best Product', 'MWdc']
         data_source = "Uniform distribution"
 
-    # Ensure all angles appear
-    for a in ANGLES:
+    # Ensure all active angles appear
+    for a in ACTIVE_ANGLES:
         if a not in angle_summary['Best Product'].values:
-            angle_summary = pd.concat([angle_summary, pd.DataFrame({'Best Product': [a], 'MWdc': [0]})],
-                                       ignore_index=True)
-
+            angle_summary = pd.concat([angle_summary,
+                                       pd.DataFrame({'Best Product': [a], 'MWdc': [0]})],
+                                      ignore_index=True)
+    angle_summary = angle_summary[angle_summary['Best Product'].isin(ACTIVE_ANGLES)].copy()
     angle_summary = angle_summary.sort_values('Best Product')
     angle_summary['GWdc'] = (angle_summary['MWdc'] / 1000).round(2)
-    angle_summary['Share (%)'] = (angle_summary['MWdc'] / angle_summary['MWdc'].sum() * 100).round(1)
+    total_for_share = angle_summary['MWdc'].sum()
+    angle_summary['Share (%)'] = (angle_summary['MWdc'] / total_for_share * 100).round(1) if total_for_share > 0 else 0
     angle_summary['Best Product'] = angle_summary['Best Product'].astype(str) + '°'
 
     c1, c2 = st.columns([1, 2])
     with c1:
-        st.markdown(f"**{yr_label}**  —  Total Market: **{total_gw:.0f} GWdc**")
+        st.markdown(f"**{yr_label}**  —  Total Market: **{total_gw:.1f} GWdc**")
         st.caption(f"Source: {data_source}")
         display_df = angle_summary[['Best Product', 'GWdc', 'MWdc', 'Share (%)']].copy()
         display_df['MWdc'] = display_df['MWdc'].round(0).astype(int)
@@ -402,24 +472,31 @@ def render_market_share(computed, orennia_df, label=""):
         chart_df = angle_summary.set_index('Best Product')[['GWdc']]
         st.bar_chart(chart_df, use_container_width=True, height=300)
 
-    # ─── 3D Demand Map: MW capacity columns by location, colored by best angle ───
-    st.markdown("#### 🏗️ Demand by Location (MWdc)")
+    # ─── Export button ───
+    export_df = build_export(display_df, selected_years, total_gw, label)
+    csv_bytes = export_df.to_csv(index=False).encode()
+    st.download_button(
+        "📥 Export Summary CSV", csv_bytes,
+        file_name=f"hail_summary_{label.replace(' ', '_')}_{yr_label}.csv",
+        mime="text/csv", key=f"export_{label}",
+    )
 
-    # Build location-level demand data for the map
+    # ─── 3D Demand Map ───
+    st.markdown("#### 🏗️ Demand by Location (MWdc)")
     if merged is not None and len(merged) > 0:
         map_demand = merged[['lat', 'lon', 'best_angle', 'scaled_mw']].copy()
         map_demand.rename(columns={'scaled_mw': 'mw'}, inplace=True)
     else:
-        # Uniform fallback: every location gets equal share
         map_demand = computed[['lat', 'lon', 'best_angle']].copy()
         n_locs = len(map_demand)
         map_demand['mw'] = total_mw / n_locs if n_locs > 0 else 0
 
-    map_demand = map_demand[map_demand['mw'] > 0].copy()
+    map_demand = map_demand[(map_demand['mw'] > 0) &
+                             (map_demand['best_angle'].isin(ACTIVE_ANGLES))].copy()
 
     if len(map_demand) > 0:
         map_demand['color'] = map_demand['best_angle'].map(ANGLE_COLORS)
-        map_demand['elevation'] = map_demand['mw'] * 200  # scale for visibility
+        map_demand['elevation'] = map_demand['mw'] * 200
         map_demand['mw_display'] = map_demand['mw'].round(0).astype(int).astype(str)
         map_demand['angle_display'] = map_demand['best_angle'].astype(str) + '°'
 
@@ -440,21 +517,18 @@ def render_market_share(computed, orennia_df, label=""):
                                 "fontSize": "13px", "padding": "8px 12px", "borderRadius": "8px"}},
         ), use_container_width=True, height=500)
     else:
-        st.info("No demand data to display for the selected year.")
+        st.info("No demand data to display for the selected years.")
 
-    # Year-over-year comparison table
-    if selected_year == 'All Years':
+    # ─── Year-by-Year Breakdown ───
+    if len(selected_years) > 1:
         st.markdown("#### Year-by-Year Breakdown")
         yoy_rows = []
-        for yr in years:
+        for yr in selected_years:
             yr_mw = market_sizes[yr] * 1000
-            n_locs = len(computed)
-            mw_per = yr_mw / n_locs if n_locs > 0 else 0
-
-            if has_orennia and orennia_df is not None:
-                yr_oren = orennia_df[orennia_df['Year'] == yr]
-                if len(yr_oren) > 0:
-                    dbl = yr_oren.groupby(['hail_lat', 'hail_lon']).agg(
+            if has_shape:
+                yr_shape = shape_df[shape_df['Year'] == yr]
+                if len(yr_shape) > 0:
+                    dbl = yr_shape.groupby(['hail_lat', 'hail_lon']).agg(
                         total_mw=('DC Capacity (MW)', 'sum')).reset_index()
                     mrg = dbl.merge(computed[['lat', 'lon', 'best_angle']],
                                     left_on=['hail_lat', 'hail_lon'],
@@ -462,38 +536,79 @@ def render_market_share(computed, orennia_df, label=""):
                     if len(mrg) > 0:
                         sc = yr_mw / mrg['total_mw'].sum() if mrg['total_mw'].sum() > 0 else 1
                         mrg['scaled_mw'] = mrg['total_mw'] * sc
-                        for a in ANGLES:
+                        for a in ACTIVE_ANGLES:
                             sub = mrg[mrg['best_angle'] == a]
                             yoy_rows.append({'Year': yr, 'Angle': f'{a}°',
-                                             'GWdc': round(sub['scaled_mw'].sum() / 1000, 2),
-                                             'MWdc': int(sub['scaled_mw'].sum())})
+                                             'GWdc': round(sub['scaled_mw'].sum() / 1000, 2)})
                         continue
-
-            # Fallback: uniform
+            # Uniform fallback for this year
             counts = computed['best_angle'].value_counts()
-            for a in ANGLES:
+            n = len(computed)
+            mw_per = yr_mw / n if n > 0 else 0
+            for a in ACTIVE_ANGLES:
                 cnt = counts.get(a, 0)
                 yoy_rows.append({'Year': yr, 'Angle': f'{a}°',
-                                 'GWdc': round(cnt * mw_per / 1000, 2),
-                                 'MWdc': int(cnt * mw_per)})
-
+                                 'GWdc': round(cnt * mw_per / 1000, 2)})
         if yoy_rows:
             yoy_df = pd.DataFrame(yoy_rows)
             pivot = yoy_df.pivot_table(index='Angle', columns='Year', values='GWdc',
-                                        aggfunc='sum').fillna(0)
+                                       aggfunc='sum').fillna(0)
             st.dataframe(pivot, use_container_width=True)
+
+
+def build_export(market_table, selected_years, total_gw, label):
+    """Build a single CSV-ready export of inputs and outputs."""
+    rows = []
+    rows.append({'Section': 'Inputs', 'Key': 'Glass Type', 'Value': glass_choice})
+    if glass_choice == "Blended":
+        rows.append({'Section': 'Inputs', 'Key': '2.0 mm Share (%)', 'Value': glass_pct_20})
+    rows.append({'Section': 'Inputs', 'Key': 'Tilt Angles Active',
+                 'Value': ', '.join([f'{a}°' for a in ACTIVE_ANGLES])})
+    rows.append({'Section': 'Inputs', 'Key': 'Replacement Cost ($/W)', 'Value': replacement_cost})
+    rows.append({'Section': 'Inputs', 'Key': 'Discount Rate (%)', 'Value': interest_rate})
+    rows.append({'Section': 'Inputs', 'Key': 'Coverage Ratio (%)', 'Value': coverage_ratio})
+    rows.append({'Section': 'Inputs', 'Key': 'Annual Premium (%)', 'Value': annual_premium})
+    rows.append({'Section': 'Inputs', 'Key': 'Dev Risk Considered (%)', 'Value': risk_pct})
+    rows.append({'Section': 'Inputs', 'Key': '52° CapEx (¢/W)', 'Value': capex_52})
+    rows.append({'Section': 'Inputs', 'Key': '60° CapEx (¢/W)', 'Value': capex_60})
+    rows.append({'Section': 'Inputs', 'Key': '70° CapEx (¢/W)', 'Value': capex_70})
+    rows.append({'Section': 'Inputs', 'Key': '77° CapEx (¢/W)', 'Value': capex_77})
+    rows.append({'Section': 'Inputs', 'Key': 'Insurance Layer',
+                 'Value': 'On' if ins_on else 'Off'})
+    rows.append({'Section': 'Inputs', 'Key': 'Dev Risk Layer',
+                 'Value': 'On' if risk_on else 'Off'})
+    rows.append({'Section': 'Inputs', 'Key': 'CapEx Layer',
+                 'Value': 'On' if capex_on else 'Off'})
+    rows.append({'Section': 'Inputs', 'Key': 'Demand Shape', 'Value': demand_shape})
+    rows.append({'Section': 'Inputs', 'Key': 'Demand Magnitude Source', 'Value': magnitude_source})
+    rows.append({'Section': 'Inputs', 'Key': 'Years Selected',
+                 'Value': ', '.join(str(y) for y in selected_years)})
+    rows.append({'Section': 'Inputs', 'Key': 'Total Market (GWdc)', 'Value': round(total_gw, 2)})
+    for yr in selected_years:
+        rows.append({'Section': 'Market Size', 'Key': f'{yr} (GWdc)',
+                     'Value': market_sizes[yr]})
+
+    for _, mr in market_table.iterrows():
+        rows.append({'Section': 'Market Share',
+                     'Key': f"{mr['Best Product']} GWdc", 'Value': mr['GWdc']})
+        rows.append({'Section': 'Market Share',
+                     'Key': f"{mr['Best Product']} MWdc", 'Value': mr['MWdc']})
+        rows.append({'Section': 'Market Share',
+                     'Key': f"{mr['Best Product']} Share (%)", 'Value': mr['Share (%)']})
+
+    return pd.DataFrame(rows)
 
 
 # ─── Value Gap Analysis (portfolio baseline) ───
 def render_value_gap(computed, label=""):
     st.markdown("---")
     st.markdown("### 💰 Value Gap Analysis" + (f" — {label}" if label else ""))
-    st.markdown("The **base case** is the full 4-product portfolio (always picks cheapest). "
+    st.markdown("The **base case** is the full set of active tilt angles (always picks cheapest). "
                 "Selecting fewer products shows the added cost of limiting your portfolio.")
 
-    gap_cols = st.columns(4)
+    gap_cols = st.columns(max(1, len(ACTIVE_ANGLES)))
     selected = []
-    for i, angle in enumerate(ANGLES):
+    for i, angle in enumerate(ACTIVE_ANGLES):
         with gap_cols[i]:
             if st.checkbox(f"{angle}°", value=True, key=f"vg_{angle}_{label}"):
                 selected.append(angle)
@@ -502,15 +617,10 @@ def render_value_gap(computed, label=""):
         st.warning("Select at least one product angle.")
         return
 
-    # Base case: full portfolio (min across all 4)
-    computed['base_cost'] = computed[[f'total_{a}' for a in ANGLES]].min(axis=1)
-
-    # Subset: min across selected angles only
-    if len(selected) == len(ANGLES):
-        computed['subset_cost'] = computed['base_cost']
-    else:
-        computed['subset_cost'] = computed[[f'total_{a}' for a in selected]].min(axis=1)
-
+    # Base case: full active portfolio
+    computed['base_cost'] = computed[[f'total_{a}' for a in ACTIVE_ANGLES]].min(axis=1)
+    # Subset
+    computed['subset_cost'] = computed[[f'total_{a}' for a in selected]].min(axis=1)
     computed['gap'] = computed['subset_cost'] - computed['base_cost']
 
     max_gap = computed['gap'].quantile(0.95) if computed['gap'].max() > 0 else 1.0
@@ -625,9 +735,9 @@ new_annuity = annuity_factor(interest_rate / 100.0)
 st.caption(f"Discount rate: {interest_rate:.2f}% → {new_annuity:.2f}× annuity "
            f"(base: 6.00% → {BASE_ANNUITY:.2f}×)  |  "
            f"Premium: {annual_premium:.2f}%  |  Coverage: {coverage_ratio}%  |  "
-           f"Demand: **{demand_source}**")
+           f"Demand shape: **{demand_shape}**  |  Magnitude: **{magnitude_source}**")
 
-orennia_df = _demand_df  # loaded in sidebar section (Orennia or WoodMac)
+shape_df = _shape_df  # demand shape data (Orennia or WoodMac)
 
 if glass_choice == "Compare Both":
     df20, df32 = load_data('20'), load_data('32')
@@ -635,12 +745,12 @@ if glass_choice == "Compare Both":
     with tab1:
         comp20 = render_single(df20, "2.0 mm Glass")
         render_lookup(df20, comp20, "2.0mm")
-        render_market_share(comp20, orennia_df, "2.0mm")
+        render_market_share(comp20, shape_df, "2.0mm")
         render_value_gap(comp20, "2.0mm")
     with tab2:
         comp32 = render_single(df32, "3.2 mm Glass")
         render_lookup(df32, comp32, "3.2mm")
-        render_market_share(comp32, orennia_df, "3.2mm")
+        render_market_share(comp32, shape_df, "3.2mm")
         render_value_gap(comp32, "3.2mm")
 
     # Glass comparison
@@ -658,12 +768,24 @@ if glass_choice == "Compare Both":
         cdf['3.2mm Cost'] = cdf['3.2mm Cost'].round(4)
         st.dataframe(cdf.sort_values('Lat'), hide_index=True, use_container_width=True, height=300)
 
+elif glass_choice == "Blended":
+    df20, df32 = load_data('20'), load_data('32')
+    blended = compute_blended(df20, df32, glass_pct_20, replacement_cost, coverage_ratio,
+                              annual_premium, interest_rate, risk_pct, capex_dict,
+                              ins_on, risk_on, capex_on, active_angles=ACTIVE_ANGLES)
+    label = f"Blended ({glass_pct_20}% 2.0mm / {100-glass_pct_20}% 3.2mm)"
+    # Render single uses precomputed to avoid recomputing
+    render_single(df32, label, precomputed=blended)
+    render_lookup(df32, blended, "Blended")
+    render_market_share(blended, shape_df, "Blended")
+    render_value_gap(blended, "Blended")
+
 else:
     suffix = '32' if glass_choice == "3.2 mm" else '20'
     df = load_data(suffix)
     computed = render_single(df, glass_choice)
     render_lookup(df, computed, glass_choice)
-    render_market_share(computed, orennia_df, glass_choice)
+    render_market_share(computed, shape_df, glass_choice)
     render_value_gap(computed, glass_choice)
 
 # ─── Parameter Summary ───
@@ -671,15 +793,21 @@ st.markdown("---")
 st.markdown("### 📊 Current Parameter Summary")
 p1, p2, p3 = st.columns(3)
 with p1:
-    st.markdown(f"| Parameter | Value |\n|---|---|\n| Replacement Cost | **${replacement_cost:.2f}/W** |"
-                f"\n| Discount Rate | **{interest_rate:.2f}%** |\n| Annuity Factor | **{new_annuity:.2f}×** |")
+    glass_label = glass_choice
+    if glass_choice == "Blended":
+        glass_label = f"Blended ({glass_pct_20}/{100-glass_pct_20})"
+    st.markdown(f"| Parameter | Value |\n|---|---|\n| Glass Type | **{glass_label}** |"
+                f"\n| Replacement Cost | **${replacement_cost:.2f}/W** |"
+                f"\n| Discount Rate | **{interest_rate:.2f}%** |\n| Annuity Factor | **{new_annuity:.2f}×** |"
+                f"\n| Active Angles | **{', '.join(str(a)+'°' for a in ACTIVE_ANGLES)}** |")
 with p2:
     st.markdown(f"| Parameter | Value |\n|---|---|\n| Annual Premium | **{annual_premium:.2f}%** |"
                 f"\n| Coverage Ratio | **{coverage_ratio}%** |\n| Dev Risk Factor | **{risk_pct}%** |"
                 f"\n| Active Layers | **{layers_str}** |"
-                f"\n| Demand Source | **{demand_source}** |")
+                f"\n| Demand Shape | **{demand_shape}** |"
+                f"\n| Magnitude Source | **{magnitude_source}** |")
 with p3:
     mkt_str = "| Year | GWdc |\n|---|---|"
     for yr in sorted(market_sizes.keys()):
-        mkt_str += f"\n| {yr} | **{market_sizes[yr]:.0f}** |"
+        mkt_str += f"\n| {yr} | **{market_sizes[yr]:.1f}** |"
     st.markdown(mkt_str)
