@@ -32,7 +32,7 @@ def annuity_factor(r, n=40):
 
 
 # ─── Page Config ───
-st.set_page_config(page_title="Hail Risk Sensitivity Tool v6", page_icon="🌨️",
+st.set_page_config(page_title="Hail Risk Sensitivity Tool v7", page_icon="🌨️",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -41,9 +41,13 @@ st.markdown("""
     .stApp { font-family: 'DM Sans', sans-serif; }
     .main-title { font-size: 2rem; font-weight: 700; color: #1a1a2e; margin-bottom: 0; letter-spacing: -0.5px; }
     .subtitle { font-size: 1rem; color: #6b7280; margin-top: 0; margin-bottom: 1.5rem; }
-    section[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%); color: #e2e8f0; }
-    section[data-testid="stSidebar"] .stMarkdown h3 { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1.5px; margin-top: 1.5rem; }
-    section[data-testid="stSidebar"] label { color: #cbd5e1 !important; }
+    section[data-testid="stSidebar"] { background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%); color: #f1f5f9; }
+    section[data-testid="stSidebar"] .stMarkdown h3 { color: #f8fafc; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1.5px; margin-top: 1.5rem; font-weight: 700; }
+    section[data-testid="stSidebar"] label { color: #f1f5f9 !important; font-weight: 500; }
+    section[data-testid="stSidebar"] .stMarkdown p { color: #e2e8f0 !important; }
+    section[data-testid="stSidebar"] .stRadio label, section[data-testid="stSidebar"] .stCheckbox label { color: #f8fafc !important; }
+    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: #cbd5e1 !important; }
+    section[data-testid="stSidebar"] .stNumberInput label, section[data-testid="stSidebar"] .stSlider label { color: #f1f5f9 !important; }
     .metric-card { background: linear-gradient(135deg, #f8fafc, #f1f5f9); border-radius: 12px; padding: 1.2rem; border: 1px solid #e2e8f0; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
     .metric-card h4 { margin: 0; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: #64748b; }
     .metric-card .value { font-family: 'JetBrains Mono', monospace; font-size: 1.5rem; font-weight: 700; margin: 0.3rem 0; }
@@ -142,6 +146,39 @@ def compute_blended(df20, df32, pct_20, replacement_cost, coverage_ratio, annual
     return blended
 
 
+def compute_luce_probabilities(computed, sigma, active_angles):
+    """Compute Luce/Logit probability of each tilt angle winning at each location.
+
+    Uses per-location cost normalization: subtract min cost across active angles so
+    the cheapest angle has utility 0. Then P_a = exp(-sigma * C_a_norm) / sum_j exp(-sigma * C_j_norm).
+    """
+    if len(active_angles) == 0:
+        return computed.copy()
+
+    cost_cols = [f'total_{a}' for a in active_angles]
+    costs = computed[cost_cols].values  # shape (n_locations, n_active)
+
+    # Per-location normalization: subtract min so cheapest has cost 0
+    min_costs = costs.min(axis=1, keepdims=True)
+    costs_norm = costs - min_costs  # shape (n_locations, n_active)
+
+    # Softmax with negative utility: lower cost -> higher probability
+    exponents = -sigma * costs_norm  # negative because lower cost = higher utility
+    # Numerical stability: subtract max (but since min cost is 0, max exponent is 0 -> already stable)
+    exp_vals = np.exp(exponents)
+    probs = exp_vals / exp_vals.sum(axis=1, keepdims=True)
+
+    result = computed.copy()
+    for i, angle in enumerate(active_angles):
+        result[f'prob_{angle}'] = probs[:, i]
+    # For angles not in active set, probability = 0
+    for angle in ANGLES:
+        if angle not in active_angles:
+            result[f'prob_{angle}'] = 0.0
+
+    return result
+
+
 def interpolate_best_product(lats, lons, best_angles):
     """Create a dense grid of best-product assignments, clipped to data footprint."""
     from scipy.interpolate import NearestNDInterpolator
@@ -230,6 +267,12 @@ st.sidebar.markdown("### Cost Layers")
 ins_on = st.sidebar.checkbox("Insurance", value=True)
 risk_on = st.sidebar.checkbox("Developer Risk", value=True)
 capex_on = st.sidebar.checkbox("CapEx Premium", value=True)
+
+st.sidebar.markdown("### Choice Model (Luce / Logit)")
+sigma = st.sidebar.slider(
+    "Sigma (cost sensitivity)", 0.0, 5.0, 2.5, 0.1,
+    help="0 = no sensitivity (all equally likely). Higher = more decisive. Default 2.5."
+)
 
 st.sidebar.markdown("### Demand Shape (geographic distribution)")
 demand_shape = st.sidebar.radio(
@@ -581,6 +624,7 @@ def build_export(market_table, selected_years, total_gw, label):
                  'Value': 'On' if capex_on else 'Off'})
     rows.append({'Section': 'Inputs', 'Key': 'Demand Shape', 'Value': demand_shape})
     rows.append({'Section': 'Inputs', 'Key': 'Demand Magnitude Source', 'Value': magnitude_source})
+    rows.append({'Section': 'Inputs', 'Key': 'Sigma (Luce sensitivity)', 'Value': sigma})
     rows.append({'Section': 'Inputs', 'Key': 'Years Selected',
                  'Value': ', '.join(str(y) for y in selected_years)})
     rows.append({'Section': 'Inputs', 'Key': 'Total Market (GWdc)', 'Value': round(total_gw, 2)})
@@ -724,6 +768,223 @@ def render_lookup(df, computed, label=""):
             st.markdown(html, unsafe_allow_html=True)
 
 
+# ─── Luce/Logit Probabilistic Market Share ───
+def render_luce_market_share(computed, shape_df, label=""):
+    """Probability-weighted market share using the Luce/Logit choice model.
+
+    Shares the same multi-year selection and shape/magnitude controls as the
+    deterministic market share section (read from module-level state).
+    """
+    st.markdown("---")
+    st.markdown("### 🎲 Probabilistic Market Share (Luce Model)"
+                + (f" — {label}" if label else "")
+                + f"  [σ = {sigma:.2f}, shape: {demand_shape}, magnitude: {magnitude_source}]")
+    st.caption("Each location splits its demand probabilistically across active tilt angles using "
+               "P(a) = exp(−σ·ΔCost_a) / Σ exp(−σ·ΔCost_j), where ΔCost is normalized to the "
+               "per-location minimum. Higher σ = more decisive; σ=0 = uniform.")
+
+    # Reuse the same year selection state as deterministic market share
+    has_shape = shape_df is not None
+    years = sorted(market_sizes.keys())
+    selected_years = [yr for yr in years if st.session_state.get(f"yrsel_{yr}_{label}", True)]
+
+    if not selected_years:
+        st.warning("Select at least one year in the deterministic market share section above.")
+        return None
+
+    total_gw = sum(market_sizes[yr] for yr in selected_years)
+    total_mw = total_gw * 1000
+    yr_label = (f"{min(selected_years)}–{max(selected_years)}"
+                if len(selected_years) > 1 else str(selected_years[0]))
+
+    # Compute Luce probabilities
+    luce = compute_luce_probabilities(computed, sigma, ACTIVE_ANGLES)
+
+    # Build location-level scaled demand using the shape source
+    merged_demand = None
+    if has_shape:
+        shape_sub = shape_df[shape_df['Year'].isin(selected_years)]
+        if len(shape_sub) > 0:
+            demand_by_loc = shape_sub.groupby(['hail_lat', 'hail_lon']).agg(
+                total_mw=('DC Capacity (MW)', 'sum')).reset_index()
+            merge_cols = ['lat', 'lon'] + [f'prob_{a}' for a in ANGLES]
+            merged_demand = demand_by_loc.merge(
+                luce[merge_cols],
+                left_on=['hail_lat', 'hail_lon'], right_on=['lat', 'lon'], how='inner')
+            if len(merged_demand) > 0:
+                shape_total = merged_demand['total_mw'].sum()
+                scale = total_mw / shape_total if shape_total > 0 else 1.0
+                merged_demand['scaled_mw'] = merged_demand['total_mw'] * scale
+
+    if merged_demand is None or len(merged_demand) == 0:
+        # Uniform fallback
+        mw_per_loc = total_mw / len(luce) if len(luce) > 0 else 0
+        merged_demand = luce[['lat', 'lon'] + [f'prob_{a}' for a in ANGLES]].copy()
+        merged_demand['scaled_mw'] = mw_per_loc
+        data_source = "Uniform distribution"
+    else:
+        data_source = f"Shape: {demand_shape} (scaled to {total_gw:.1f} GW)"
+
+    # Probability-adjusted market share by angle: sum across locations of (scaled_mw * P_a)
+    angle_rows = []
+    for a in ACTIVE_ANGLES:
+        mw_a = (merged_demand['scaled_mw'] * merged_demand[f'prob_{a}']).sum()
+        angle_rows.append({'Best Product': f'{a}°', 'MWdc': mw_a})
+    angle_summary = pd.DataFrame(angle_rows)
+    angle_summary['GWdc'] = (angle_summary['MWdc'] / 1000).round(2)
+    tot = angle_summary['MWdc'].sum()
+    angle_summary['Share (%)'] = (angle_summary['MWdc'] / tot * 100).round(1) if tot > 0 else 0
+    angle_summary['MWdc'] = angle_summary['MWdc'].round(0).astype(int)
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.markdown(f"**{yr_label}**  —  Total Market: **{total_gw:.1f} GWdc**")
+        st.caption(f"Source: {data_source}")
+        st.dataframe(angle_summary[['Best Product', 'GWdc', 'MWdc', 'Share (%)']],
+                     hide_index=True, use_container_width=True)
+    with c2:
+        chart_df = angle_summary.set_index('Best Product')[['GWdc']]
+        st.bar_chart(chart_df, use_container_width=True, height=300)
+
+    # Year-by-year probabilistic breakdown
+    if len(selected_years) > 1:
+        st.markdown("#### Year-by-Year Probabilistic Breakdown")
+        yoy_rows = []
+        for yr in selected_years:
+            yr_mw = market_sizes[yr] * 1000
+            if has_shape:
+                yr_shape = shape_df[shape_df['Year'] == yr]
+                if len(yr_shape) > 0:
+                    dbl = yr_shape.groupby(['hail_lat', 'hail_lon']).agg(
+                        total_mw=('DC Capacity (MW)', 'sum')).reset_index()
+                    mrg = dbl.merge(luce[['lat', 'lon'] + [f'prob_{a}' for a in ANGLES]],
+                                    left_on=['hail_lat', 'hail_lon'],
+                                    right_on=['lat', 'lon'], how='inner')
+                    if len(mrg) > 0:
+                        sc = yr_mw / mrg['total_mw'].sum() if mrg['total_mw'].sum() > 0 else 1
+                        mrg['scaled_mw'] = mrg['total_mw'] * sc
+                        for a in ACTIVE_ANGLES:
+                            mw_a = (mrg['scaled_mw'] * mrg[f'prob_{a}']).sum()
+                            yoy_rows.append({'Year': yr, 'Angle': f'{a}°',
+                                             'GWdc': round(mw_a / 1000, 2)})
+                        continue
+            # Uniform fallback
+            mw_per = yr_mw / len(luce)
+            for a in ACTIVE_ANGLES:
+                mw_a = (mw_per * luce[f'prob_{a}']).sum()
+                yoy_rows.append({'Year': yr, 'Angle': f'{a}°', 'GWdc': round(mw_a / 1000, 2)})
+        if yoy_rows:
+            yoy_df = pd.DataFrame(yoy_rows)
+            pivot = yoy_df.pivot_table(index='Angle', columns='Year', values='GWdc',
+                                       aggfunc='sum').fillna(0)
+            st.dataframe(pivot, use_container_width=True)
+
+    return {'luce': luce, 'merged_demand': merged_demand,
+            'angle_summary': angle_summary, 'selected_years': selected_years,
+            'total_gw': total_gw}
+
+
+def render_luce_demand_map(luce_result, label=""):
+    """Probability-adjusted demand map with red/yellow/green coloring vs random chance."""
+    if luce_result is None:
+        return
+    st.markdown("---")
+    st.markdown("### 🎯 Probability-Adjusted Demand Map" + (f" — {label}" if label else ""))
+    st.markdown("Select which tilt angles to highlight. **Bar height** = probability-adjusted demand "
+                "from the selected angles. **Bar color** = how the selected angles' combined probability "
+                "compares to random chance (k/n where k = selected, n = active).")
+
+    # Checkboxes — second layer of selection, only among active angles
+    cb_cols = st.columns(max(1, len(ACTIVE_ANGLES)))
+    selected_angles = []
+    for i, angle in enumerate(ACTIVE_ANGLES):
+        with cb_cols[i]:
+            if st.checkbox(f"{angle}°", value=True, key=f"luce_{angle}_{label}"):
+                selected_angles.append(angle)
+
+    if len(selected_angles) == 0:
+        st.info("Select at least one angle to display the probability-adjusted map.")
+        return
+
+    n_active = len(ACTIVE_ANGLES)
+    k_selected = len(selected_angles)
+    p_random = k_selected / n_active  # baseline probability if costs were equal
+
+    merged_demand = luce_result['merged_demand']
+    map_df = merged_demand[['lat', 'lon', 'scaled_mw'] +
+                             [f'prob_{a}' for a in ACTIVE_ANGLES]].copy()
+
+    # Sum the probabilities of selected angles
+    map_df['p_selected'] = sum(map_df[f'prob_{a}'] for a in selected_angles)
+    # Probability-adjusted MW from the selected subset
+    map_df['adj_mw'] = map_df['scaled_mw'] * map_df['p_selected']
+
+    # Color: log ratio of P_selected to p_random, clamped to [-1.5, 1.5]
+    # Edge case: if all angles selected, p_selected = 1.0 and p_random = 1.0 -> ratio = 0 -> yellow
+    if p_random > 0:
+        # Avoid log(0); floor p_selected at a tiny value
+        p_safe = map_df['p_selected'].clip(lower=1e-6)
+        map_df['log_ratio'] = np.log(p_safe / p_random).clip(-1.5, 1.5)
+    else:
+        map_df['log_ratio'] = 0.0
+    map_df['color_t'] = (map_df['log_ratio'] + 1.5) / 3.0  # normalize to [0, 1]
+
+    # Build RGB scaled palette: red (low) -> yellow (mid) -> green (high)
+    def color_for(t):
+        # t in [0, 1]; 0 = dark red, 0.5 = yellow, 1 = dark green
+        if t <= 0.5:
+            # Red -> Yellow
+            f = t / 0.5  # 0..1
+            r = int(180 + (240 - 180) * f)  # 180 -> 240
+            g = int(20 + (200 - 20) * f)    # 20 -> 200
+            b = int(20 + (40 - 20) * f)     # 20 -> 40
+        else:
+            # Yellow -> Green
+            f = (t - 0.5) / 0.5  # 0..1
+            r = int(240 - (240 - 20) * f)   # 240 -> 20
+            g = int(200 + (140 - 200) * f)  # 200 -> 140
+            b = int(40 + (60 - 40) * f)     # 40 -> 60
+        return [r, g, b]
+
+    map_df['color'] = map_df['color_t'].apply(color_for)
+
+    # Map values
+    map_df = map_df[map_df['adj_mw'] > 0].copy()
+    if len(map_df) == 0:
+        st.info("No demand to display.")
+        return
+
+    map_df['elevation'] = map_df['adj_mw'] * 200
+    map_df['adj_mw_display'] = map_df['adj_mw'].round(0).astype(int).astype(str)
+    map_df['p_sel_display'] = (map_df['p_selected'] * 100).round(1).astype(str) + '%'
+    map_df['p_rand_display'] = f"{p_random*100:.1f}%"
+    map_df['ratio_display'] = (map_df['p_selected'] / p_random).round(2).astype(str) + '×'
+
+    col_layer = pdk.Layer(
+        "ColumnLayer", data=map_df, get_position='[lon, lat]',
+        get_elevation='elevation', elevation_scale=1, radius=18000,
+        get_fill_color='color', pickable=True, auto_highlight=True,
+    )
+    states_layer = pdk.Layer("GeoJsonLayer", data=US_STATES_URL,
+                             stroked=True, filled=False, pickable=False,
+                             get_line_color=[100, 100, 100, 140], line_width_min_pixels=1)
+    st.pydeck_chart(pdk.Deck(
+        layers=[states_layer, col_layer],
+        initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=45),
+        map_style="light",
+        tooltip={"html": ("<b>Selected P:</b> {p_sel_display} (random: {p_rand_display}, "
+                           "{ratio_display})<br><b>Adjusted Demand:</b> {adj_mw_display} MWdc"),
+                 "style": {"backgroundColor": "#1e293b", "color": "#e2e8f0",
+                            "fontSize": "13px", "padding": "8px 12px", "borderRadius": "8px"}},
+    ), use_container_width=True, height=500)
+
+    sel_str = ", ".join(f"{a}°" for a in selected_angles)
+    st.markdown(f"**Selected:** {sel_str}  |  **k/n random chance:** {p_random*100:.1f}%  |  "
+                f"**Avg P_selected:** {map_df['p_selected'].mean()*100:.1f}%  |  "
+                f"**Total Adj Demand:** {map_df['adj_mw'].sum()/1000:.2f} GWdc")
+    st.markdown("🔴 Red = less likely than random   🟡 Yellow = matches random chance   🟢 Green = more likely than random")
+
+
 # ═══════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════
@@ -735,7 +996,8 @@ new_annuity = annuity_factor(interest_rate / 100.0)
 st.caption(f"Discount rate: {interest_rate:.2f}% → {new_annuity:.2f}× annuity "
            f"(base: 6.00% → {BASE_ANNUITY:.2f}×)  |  "
            f"Premium: {annual_premium:.2f}%  |  Coverage: {coverage_ratio}%  |  "
-           f"Demand shape: **{demand_shape}**  |  Magnitude: **{magnitude_source}**")
+           f"Demand shape: **{demand_shape}**  |  Magnitude: **{magnitude_source}**  |  "
+           f"σ = **{sigma:.2f}**")
 
 shape_df = _shape_df  # demand shape data (Orennia or WoodMac)
 
@@ -747,11 +1009,15 @@ if glass_choice == "Compare Both":
         render_lookup(df20, comp20, "2.0mm")
         render_market_share(comp20, shape_df, "2.0mm")
         render_value_gap(comp20, "2.0mm")
+        luce20 = render_luce_market_share(comp20, shape_df, "2.0mm")
+        render_luce_demand_map(luce20, "2.0mm")
     with tab2:
         comp32 = render_single(df32, "3.2 mm Glass")
         render_lookup(df32, comp32, "3.2mm")
         render_market_share(comp32, shape_df, "3.2mm")
         render_value_gap(comp32, "3.2mm")
+        luce32 = render_luce_market_share(comp32, shape_df, "3.2mm")
+        render_luce_demand_map(luce32, "3.2mm")
 
     # Glass comparison
     st.markdown("---")
@@ -774,11 +1040,12 @@ elif glass_choice == "Blended":
                               annual_premium, interest_rate, risk_pct, capex_dict,
                               ins_on, risk_on, capex_on, active_angles=ACTIVE_ANGLES)
     label = f"Blended ({glass_pct_20}% 2.0mm / {100-glass_pct_20}% 3.2mm)"
-    # Render single uses precomputed to avoid recomputing
     render_single(df32, label, precomputed=blended)
     render_lookup(df32, blended, "Blended")
     render_market_share(blended, shape_df, "Blended")
     render_value_gap(blended, "Blended")
+    luce_b = render_luce_market_share(blended, shape_df, "Blended")
+    render_luce_demand_map(luce_b, "Blended")
 
 else:
     suffix = '32' if glass_choice == "3.2 mm" else '20'
@@ -787,6 +1054,8 @@ else:
     render_lookup(df, computed, glass_choice)
     render_market_share(computed, shape_df, glass_choice)
     render_value_gap(computed, glass_choice)
+    luce_r = render_luce_market_share(computed, shape_df, glass_choice)
+    render_luce_demand_map(luce_r, glass_choice)
 
 # ─── Parameter Summary ───
 st.markdown("---")
@@ -805,7 +1074,8 @@ with p2:
                 f"\n| Coverage Ratio | **{coverage_ratio}%** |\n| Dev Risk Factor | **{risk_pct}%** |"
                 f"\n| Active Layers | **{layers_str}** |"
                 f"\n| Demand Shape | **{demand_shape}** |"
-                f"\n| Magnitude Source | **{magnitude_source}** |")
+                f"\n| Magnitude Source | **{magnitude_source}** |"
+                f"\n| Sigma (Luce) | **{sigma:.2f}** |")
 with p3:
     mkt_str = "| Year | GWdc |\n|---|---|"
     for yr in sorted(market_sizes.keys()):
