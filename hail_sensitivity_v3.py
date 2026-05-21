@@ -32,7 +32,7 @@ def annuity_factor(r, n=40):
 
 
 # ─── Page Config ───
-st.set_page_config(page_title="Hail Risk Sensitivity Tool v7", page_icon="🌨️",
+st.set_page_config(page_title="Hail Risk Sensitivity Tool v8", page_icon="🌨️",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -190,7 +190,7 @@ def compute_luce_probabilities(computed, sigma, active_angles):
 
 
 def interpolate_best_product(lats, lons, best_angles):
-    """Create a dense grid of best-product assignments, clipped to data footprint."""
+    """Create a dense grid of best-product assignments, tightly clipped to data footprint."""
     from scipy.interpolate import NearestNDInterpolator
     from scipy.spatial import Delaunay, cKDTree
 
@@ -199,15 +199,17 @@ def interpolate_best_product(lats, lons, best_angles):
     hull = Delaunay(points)
     tree = cKDTree(points)
 
-    lat_range = np.arange(lats.min() - 0.25, lats.max() + 0.25, 0.25)
-    lon_range = np.arange(lons.min() - 0.25, lons.max() + 0.25, 0.25)
+    # Finer grid for smoother edges
+    lat_range = np.arange(lats.min(), lats.max() + 0.2, 0.2)
+    lon_range = np.arange(lons.min(), lons.max() + 0.2, 0.2)
     grid_lat, grid_lon = np.meshgrid(lat_range, lon_range)
     grid_pts = np.column_stack([grid_lat.ravel(), grid_lon.ravel()])
 
-    # Clip: only points inside convex hull AND within 1.5° of a data point
+    # Tight clip: inside convex hull AND within 0.55° of a real data point
+    # (data grid spacing is ~0.5°, so this hugs coverage without leaving coastal gaps)
     inside = hull.find_simplex(grid_pts) >= 0
     dists, _ = tree.query(grid_pts)
-    mask = inside & (dists < 1.5)
+    mask = inside & (dists < 0.55)
 
     clipped_pts = grid_pts[mask]
     grid_vals = interp(clipped_pts[:, 0], clipped_pts[:, 1])
@@ -404,29 +406,29 @@ def render_single(df, label="", precomputed=None):
 
     # Background: interpolated fill (not pickable — tooltip comes from foreground only)
     bg_layer = pdk.Layer("ScatterplotLayer", data=grid_df, get_position='[lon, lat]',
-                         get_fill_color='color', get_radius=15000, pickable=False,
-                         opacity=0.65)
+                         get_fill_color='color', get_radius=9000, pickable=False,
+                         opacity=0.45)
 
     # Foreground: actual data points (pickable for tooltip)
     fg_layer = pdk.Layer("ScatterplotLayer", data=computed, get_position='[lon, lat]',
-                         get_fill_color='color', get_radius=8000, pickable=True,
-                         auto_highlight=True, opacity=1.0)
+                         get_fill_color='color', get_radius=7000, pickable=True,
+                         auto_highlight=True, opacity=0.85)
 
-    # State borders
+    # State borders drawn last so they sit crisply on top
     states_layer = pdk.Layer(
         "GeoJsonLayer", data=US_STATES_URL,
         stroked=True, filled=False, pickable=False,
-        get_line_color=[100, 100, 100, 180], line_width_min_pixels=1,
+        get_line_color=[70, 70, 70, 200], line_width_min_pixels=1,
     )
 
     st.pydeck_chart(pdk.Deck(
-        layers=[bg_layer, states_layer, fg_layer],
-        initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=0),
+        layers=[bg_layer, fg_layer, states_layer],
+        initial_view_state=pdk.ViewState(latitude=39.0, longitude=-96.0, zoom=4.0, pitch=0),
         map_style="light",
         tooltip={"html": "<b>Best:</b> {best_angle}° — {best_cost_display} ¢/W",
                  "style": {"backgroundColor": "#1e293b", "color": "#e2e8f0",
                             "fontSize": "13px", "padding": "8px 12px", "borderRadius": "8px"}},
-    ), use_container_width=True, height=500)
+    ), use_container_width=True, height=520)
 
     # ─── Win Count Table (active angles only) ───
     st.markdown("#### 📊 Win Counts")
@@ -895,18 +897,16 @@ def render_luce_market_share(computed, shape_df, label=""):
 
 
 def render_luce_demand_map(luce_result, label=""):
-    """Probability-adjusted demand map with red/yellow/green coloring vs random chance."""
+    """3D column map of win probabilities — bar height = P(win), color = tilt angle."""
     if luce_result is None:
         return
     st.markdown("---")
-    st.markdown("### 🎯 Probability-Adjusted Demand Map" + (f" — {label}" if label else ""))
-    st.markdown("The Luce probabilities are always computed against the **full set of active tilt "
-                "angles** (the competing market). The checkboxes below select **your portfolio subset** — "
-                "the map then shows how much probability-adjusted demand that subset captures. "
-                "**Bar height** = demand × P(subset wins). **Bar color** = subset's combined probability "
-                "vs. random chance (k/n, where k = boxes checked, n = active angles).")
+    st.markdown("### 🎲 Win Probability by Location (3D Columns)" + (f" — {label}" if label else ""))
+    st.markdown("Each location shows a column per active tilt angle. **Bar height** = Luce probability "
+                "that the angle wins at that location (against the full active-angle market). "
+                "**Color** = the tilt angle. Toggle angles below to focus the view.")
 
-    # Checkboxes select the portfolio SUBSET; the competing market is always all ACTIVE_ANGLES
+    # Checkboxes select which angles' columns to display
     cb_cols = st.columns(max(1, len(ACTIVE_ANGLES)))
     selected_angles = []
     for i, angle in enumerate(ACTIVE_ANGLES):
@@ -915,66 +915,35 @@ def render_luce_demand_map(luce_result, label=""):
                 selected_angles.append(angle)
 
     if len(selected_angles) == 0:
-        st.info("Select at least one angle for your portfolio subset.")
+        st.info("Select at least one tilt angle to display.")
         return
 
-    n_active = len(ACTIVE_ANGLES)
-    k_selected = len(selected_angles)
-    p_random = k_selected / n_active  # baseline: if all costs equal, subset would capture k/n
+    luce = luce_result['luce']  # has prob_{angle} columns
 
-    merged_demand = luce_result['merged_demand']
-    map_df = merged_demand[['lat', 'lon', 'scaled_mw'] +
-                             [f'prob_{a}' for a in ACTIVE_ANGLES]].copy()
+    # Build one column per location per selected angle, offset side-by-side
+    map_rows = []
+    n_sel = len(selected_angles)
+    for _, row in luce.iterrows():
+        for j, angle in enumerate(selected_angles):
+            p = row[f'prob_{angle}']
+            if p > 0:
+                map_rows.append({
+                    'lat': row['lat'],
+                    'lon': row['lon'] + (j - (n_sel - 1) / 2) * 0.15,
+                    'elevation': p * 800000,  # scale probability (0-1) for visibility
+                    'color': ANGLE_COLORS[angle],
+                    'angle': angle,
+                    'prob_display': f"{p*100:.1f}%",
+                })
+    map_df = pd.DataFrame(map_rows)
 
-    # P(subset) = sum of full-market probabilities for the checked angles
-    map_df['p_selected'] = sum(map_df[f'prob_{a}'] for a in selected_angles)
-    # Probability-adjusted MW captured by the subset
-    map_df['adj_mw'] = map_df['scaled_mw'] * map_df['p_selected']
-
-    # Color: log ratio of P_selected to p_random, clamped to [-1.5, 1.5]
-    # Edge case: if all angles selected, p_selected = 1.0 and p_random = 1.0 -> ratio = 0 -> yellow
-    if p_random > 0:
-        # Avoid log(0); floor p_selected at a tiny value
-        p_safe = map_df['p_selected'].clip(lower=1e-6)
-        map_df['log_ratio'] = np.log(p_safe / p_random).clip(-1.5, 1.5)
-    else:
-        map_df['log_ratio'] = 0.0
-    map_df['color_t'] = (map_df['log_ratio'] + 1.5) / 3.0  # normalize to [0, 1]
-
-    # Build RGB scaled palette: red (low) -> yellow (mid) -> green (high)
-    def color_for(t):
-        # t in [0, 1]; 0 = dark red, 0.5 = yellow, 1 = dark green
-        if t <= 0.5:
-            # Red -> Yellow
-            f = t / 0.5  # 0..1
-            r = int(180 + (240 - 180) * f)  # 180 -> 240
-            g = int(20 + (200 - 20) * f)    # 20 -> 200
-            b = int(20 + (40 - 20) * f)     # 20 -> 40
-        else:
-            # Yellow -> Green
-            f = (t - 0.5) / 0.5  # 0..1
-            r = int(240 - (240 - 20) * f)   # 240 -> 20
-            g = int(200 + (140 - 200) * f)  # 200 -> 140
-            b = int(40 + (60 - 40) * f)     # 40 -> 60
-        return [r, g, b]
-
-    map_df['color'] = map_df['color_t'].apply(color_for)
-
-    # Map values
-    map_df = map_df[map_df['adj_mw'] > 0].copy()
     if len(map_df) == 0:
-        st.info("No demand to display.")
+        st.info("No probability data to display.")
         return
-
-    map_df['elevation'] = map_df['adj_mw'] * 200
-    map_df['adj_mw_display'] = map_df['adj_mw'].round(0).astype(int).astype(str)
-    map_df['p_sel_display'] = (map_df['p_selected'] * 100).round(1).astype(str) + '%'
-    map_df['p_rand_display'] = f"{p_random*100:.1f}%"
-    map_df['ratio_display'] = (map_df['p_selected'] / p_random).round(2).astype(str) + '×'
 
     col_layer = pdk.Layer(
         "ColumnLayer", data=map_df, get_position='[lon, lat]',
-        get_elevation='elevation', elevation_scale=1, radius=18000,
+        get_elevation='elevation', elevation_scale=1, radius=12000,
         get_fill_color='color', pickable=True, auto_highlight=True,
     )
     states_layer = pdk.Layer("GeoJsonLayer", data=US_STATES_URL,
@@ -984,17 +953,20 @@ def render_luce_demand_map(luce_result, label=""):
         layers=[states_layer, col_layer],
         initial_view_state=pdk.ViewState(latitude=39.0, longitude=-98.0, zoom=3.8, pitch=45),
         map_style="light",
-        tooltip={"html": ("<b>Selected P:</b> {p_sel_display} (random: {p_rand_display}, "
-                           "{ratio_display})<br><b>Adjusted Demand:</b> {adj_mw_display} MWdc"),
+        tooltip={"html": "<b>{angle}°</b> — win probability {prob_display}",
                  "style": {"backgroundColor": "#1e293b", "color": "#e2e8f0",
                             "fontSize": "13px", "padding": "8px 12px", "borderRadius": "8px"}},
     ), use_container_width=True, height=500)
 
-    sel_str = ", ".join(f"{a}°" for a in selected_angles)
-    st.markdown(f"**Selected:** {sel_str}  |  **k/n random chance:** {p_random*100:.1f}%  |  "
-                f"**Avg P_selected:** {map_df['p_selected'].mean()*100:.1f}%  |  "
-                f"**Total Adj Demand:** {map_df['adj_mw'].sum()/1000:.2f} GWdc")
-    st.markdown("🔴 Red = less likely than random   🟡 Yellow = matches random chance   🟢 Green = more likely than random")
+    # Legend + summary
+    legend = "  ".join(
+        f'<span style="color:rgb({ANGLE_COLORS[a][0]},{ANGLE_COLORS[a][1]},{ANGLE_COLORS[a][2]});'
+        f'font-weight:700">■ {a}°</span>'
+        for a in selected_angles)
+    st.markdown(legend, unsafe_allow_html=True)
+    avg_str = "  |  ".join(
+        f"{a}° avg P: {luce[f'prob_{a}'].mean()*100:.1f}%" for a in selected_angles)
+    st.markdown(f"**{avg_str}**")
 
 
 # ═══════════════════════════════════════════
